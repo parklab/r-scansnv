@@ -65,7 +65,7 @@ get.fdr.tuning.parameters <- function(somatic, hsnps, bins=20)
 {
     cat(sprintf("        estimating bounds on somatic mutation rate..\n"))
 
-    max.dp <- quantile(hsnps$dp, prob=0.9)
+    max.dp <- as.integer(quantile(hsnps$dp, prob=0.9))
     fcs <- lapply(0:max.dp, function(dp)
         fcontrol(germ.df=hsnps[hsnps$dp == dp,], # & hsnps[,scalt] >= sc.min.alt,],
                 som.df=somatic[somatic$dp == dp,],
