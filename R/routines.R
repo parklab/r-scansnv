@@ -212,7 +212,7 @@ genotype.somatic <- function(gatk, gatk.lowmq, sc.idx, bulk.idx,
                 somatic=somatic$HS/somatic$dp, max.q=cg.hs.q)
     }
     
-    somatic$dp.test <- somatic$dp > min.sc.dp & somatic$bulk.dp > min.bulk.dp
+    somatic$dp.test <- somatic$dp >= min.sc.dp & somatic$bulk.dp >= min.bulk.dp
 
     cat("step 6: calling somatic SNVs\n")
     somatic$pass <-
