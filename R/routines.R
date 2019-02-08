@@ -1,8 +1,8 @@
 # given two data frames of somatic and germline locations, annotate
 # the somatic data frame with the position of the nearest germline entry.
-find.nearest.germline <- function(som, germ) {
+find.nearest.germline <- function(som, germ, chrs=c(1:22,'X')) {
     som$nearest.het <- NA
-    for (chr in 1:22) {
+    for (chr in chrs) {
         gpos <- germ$pos[germ$chr == chr]
         spos <- som$pos[som$chr == chr]
         gidx <- findInterval(spos, gpos)
@@ -10,18 +10,6 @@ find.nearest.germline <- function(som, germ) {
         som$nearest.het[som$chr == chr] <- gpos[nearest.idx]
     }
     som
-}
-
-# Reject somatic sites with data points lying outside of the specified
-# quantiles (min.q, max.q) at germline sites.
-# These types of tests are controlled by SENSITIVITY to germline sites
-# (which hopefully applies to somatic sites) rather than the AB tests
-# that aim to control the FDR.
-test.against.hsnps <- function(hsnps, somatic, min.q=0, max.q=1) {
-    x <- quantile(hsnps[!is.na(hsnps)], probs=c(min.q, max.q))
-    min.cutoff <- x[1]
-    max.cutoff <- x[2]
-    somatic >= min.cutoff & somatic <= max.cutoff
 }
 
 muttype.map <- c(
@@ -61,19 +49,23 @@ get.3mer <- function(df) {
 }
 
 # somatic and hsnps must have 'af' and 'dp' columns
-get.fdr.tuning.parameters <- function(somatic, hsnps, bins=20)
+get.fdr.tuning.parameters <- function(somatic, hsnps, bins=20, random.seed=0)
 {
-    cat(sprintf("        estimating bounds on somatic mutation rate..\n"))
+    cat(sprintf("estimating bounds on somatic mutation rate (seed=%d)..\n",
+        random.seed))
+    # fcontrol -> estimate.somatic.burden relies on simulations to
+    # estimate the artifact:mutation ratio.
+    set.seed(random.seed)
 
     max.dp <- as.integer(quantile(hsnps$dp, prob=0.9))
     fcs <- lapply(0:max.dp, function(dp)
-        fcontrol(germ.df=hsnps[hsnps$dp == dp,], # & hsnps[,scalt] >= sc.min.alt,],
+        fcontrol(germ.df=hsnps[hsnps$dp == dp,],
                 som.df=somatic[somatic$dp == dp,],
-                bins=bins, min.dp=0)
+                bins=bins)
     )
-    fc.max <- fcontrol(germ.df=hsnps[hsnps$dp > max.dp,], # & hsnps[,scalt] > sc.min.alt,],
+    fc.max <- fcontrol(germ.df=hsnps[hsnps$dp > max.dp,],
                 som.df=somatic[somatic$dp > max.dp,],
-                bins=bins, min.dp=0)
+                bins=bins)
     fcs <- c(fcs, list(fc.max))
     cat(sprintf("        profiled hSNP and somatic VAFs at depths %d .. %d\n",
         0, max.dp))
@@ -106,16 +98,21 @@ apply.fdr.tuning.parameters <- function(somatic, fdr.tuning) {
 }
 
 genotype.somatic <- function(gatk, gatk.lowmq, sc.idx, bulk.idx,
-    sites.with.ab, somatic.cigars, hsnp.cigars, fdr.tuning, spikein=FALSE,
-    cap.alpha=TRUE, cg.id.q=0.9, cg.hs.q=0.9, random.seed=0, target.fdr=0.1,
+    sites.with.ab, sc.cigars, bulk.cigars, cigar.training, cigar.emp.score,
+    fdr.tuning, spikein=FALSE,
+    cap.alpha=TRUE, cg.id.q=0.05, cg.hs.q=0.05, random.seed=0, target.fdr=0.1,
     bulkref=bulk.idx+1, bulkalt=bulk.idx+2, scref=sc.idx+1, scalt=sc.idx+2,
-    min.bulk.dp=0, min.sc.dp=0)
+    min.sc.alt=0, min.sc.dp=0, min.bulk.dp=0)
 {
     call.fingerprint <- as.list(environment())
     # almost all of this information is saved in the results
     dont.save <- c('gatk', 'gatk.lowmq', 'sites.with.ab',
-        'somatic.cigars', 'hsnp.cigars')
+        'sc.cigars', 'bulk.cigars')
     call.fingerprint <- call.fingerprint[!(names(call.fingerprint) %in% dont.save)]
+
+    # N.B.: there used to be some randomness in this function, but I
+    # believe all of it now resides elsewhere. To be safe, I've left
+    # this set.seed so that results can be reproduced.
     set.seed(random.seed)
 
     cat("step 1: preparing data\n")
@@ -193,25 +190,25 @@ genotype.somatic <- function(gatk, gatk.lowmq, sc.idx, bulk.idx,
         # so it is necessary to short circuit this test.
         somatic$lowmq.test <- is.na(somatic[,cn]) | somatic[,cn] == 0 | spikein
     }
-    if (missing(somatic.cigars) | missing(hsnp.cigars)) {
-        cat("        WARNING: skipping CIGAR filters. will increase FP rate\n")
-        somatic$cg.id.test <- TRUE
-        somatic$cg.hs.test <- TRUE
-    } else {
-        somatic <- merge(somatic, somatic.cigars,
-            by=c('chr', 'pos'), all.x=T)
-        hsnp.cigars <- merge(hsnp.cigars, gatk[,c('chr', 'pos', 'dp')], all.x=T)
-        hsnp.cigars <- hsnp.cigars[hsnp.cigars$dp > 0,]
-        cat("        Excessive indel CIGAR ops\n")
-        somatic$cg.id.test <-
-            test.against.hsnps(hsnp.cigars$ID/hsnp.cigars$dp,
-                somatic=somatic$ID/somatic$dp, max.q=cg.id.q)
-        cat("        Excessive clipped read CIGAR ops\n")
-        somatic$cg.hs.test <-
-            test.against.hsnps(hsnp.cigars$HS/hsnp.cigars$dp,
-                somatic=somatic$HS/somatic$dp, max.q=cg.hs.q)
-    }
+
+    somatic <- merge(somatic, sc.cigars, by=c('chr', 'pos'), all.x=T)
+    somatic <- merge(somatic, bulk.cigars, by=c('chr', 'pos'), all.x=T,
+        suffixes=c('', '.bulk'))
+    somatic$id.score.y <- somatic$ID.cigars / somatic$dp.cigars
+    somatic$id.score.x <- somatic$ID.cigars.bulk / somatic$dp.cigars.bulk
+    somatic$id.score <- cigar.emp.score(training=cigar.training, test=somatic, which='id')
+    somatic$hs.score.y <- somatic$HS.cigars / somatic$dp.cigars
+    somatic$hs.score.x <- somatic$HS.cigars.bulk / somatic$dp.cigars.bulk
+    somatic$hs.score <- cigar.emp.score(training=cigar.training, test=somatic, which='hs')
+
+    cat("        Excessive indel CIGAR ops\n")
+    somatic$cigar.id.test <-
+        somatic$id.score > quantile(cigar.training$id.score, prob=cg.id.q, na.rm=T)
+    cat("        Excessive clipped read CIGAR ops\n")
+    somatic$cigar.hs.test <-
+        somatic$hs.score > quantile(cigar.training$hs.score, prob=cg.hs.q, na.rm=T)
     
+
     somatic$dp.test <- somatic$dp >= min.sc.dp & somatic$bulk.dp >= min.bulk.dp
 
     cat("step 6: calling somatic SNVs\n")
@@ -219,8 +216,8 @@ genotype.somatic <- function(gatk, gatk.lowmq, sc.idx, bulk.idx,
         somatic$abc.pv > 0.05 &
         somatic$lysis.pv <= somatic$lysis.alpha &
         somatic$mda.pv <= somatic$mda.alpha &
-        somatic$cg.id.test & somatic$cg.hs.test &
-        somatic$lowmq.test & somatic$dp.test
+        somatic$cigar.id.test & somatic$cigar.hs.test &
+        somatic$lowmq.test & somatic$dp.test & somatic[,scalt] >= min.sc.alt
     cat(sprintf("        %d passing somatic SNVs\n", sum(somatic$pass)))
     cat(sprintf("        %d filtered somatic SNVs\n", sum(!somatic$pass)))
 
@@ -239,7 +236,7 @@ genotype.somatic <- function(gatk, gatk.lowmq, sc.idx, bulk.idx,
 # 'factor' allows changing the relationship of ab -> af
 # NOTE: for many calls, is best for the caller to compute ghd once
 # and supply it to successive calls.
-dreads <- function(ys, d, gp.mu, gp.sd, factor=1, ghd=gaussHermiteData(32)) {
+dreads <- function(ys, d, gp.mu, gp.sd, factor=1, ghd=gaussHermiteData(128)) {
     require(fastGHQuad)
     
     sapply(ys, function(y)
@@ -302,12 +299,9 @@ test2 <- function(altreads, gp.mu, gp.sd, dp, div) {
 }
 
 
-# jitter - to remove integer effects. Using depth cutoffs is generally
-# a bad strategy because DP and balance are correlated
-bin.afs <- function(afs, bins=20, jit.amt=0.001) {
+bin.afs <- function(afs, bins=20) {
     sq <- seq(0, 1, 1/bins)
-    jafs <- pmin(pmax(jitter(afs, amount=jit.amt), 0), 1)
-    x <- findInterval(jafs, sq, left.open=TRUE)
+    x <- findInterval(afs, sq, left.open=TRUE)
     # af=0 will be assigned to bin 0 because intervals are (.,.]
     x[x==0] <- 1
     tx <- tabulate(x, nbins=bins)
@@ -335,7 +329,9 @@ estimate.somatic.burden <- function(fc, min.s=1, max.s=5000, n.subpops=10, displ
     # determine how often a sample of N somatic mutations from the
     # proper het distribution (germlines) "fits" inside the somatic
     # candidate distribution.
-    srange <- seq(min.s, max.s, length.out=n.subpops)
+    # always try nmut=1-100
+    srange <- c(1:100, seq(101, max.s, length.out=n.subpops))
+    srange <- srange[srange < max.s]
     fraction.embedded <- sapply(srange, sim, g=fc$g, s=fc$s)
     min.burden <- max(c(1, srange[fraction.embedded >= 1 - (1 - rough.interval)/2]))
     max.burden <- max(srange[fraction.embedded >= (1 - rough.interval)/2])
@@ -345,30 +341,34 @@ estimate.somatic.burden <- function(fc, min.s=1, max.s=5000, n.subpops=10, displ
 # {germ,som}.df need only have columns named dp and af
 # estimate the population component of FDR
 # ignore.100 - ignore variants with VAF=100
-fcontrol <- function(germ.df, som.df, min.dp=10, jit.amt=0.0000001, bins=20, doublet=FALSE, rough.interval=0.99) {
-    germ.afs <- germ.df$af[germ.df$dp >= min.dp & !is.na(germ.df$af)]
-    som.afs <- som.df$af[som.df$dp >= min.dp & !is.na(som.df$af)]
-    g <- bin.afs(germ.afs, jit.amt=jit.amt, bins=bins)  # counts, not probabilities
-    s <- bin.afs(som.afs, jit.amt=jit.amt, bins=bins)
+fcontrol <- function(germ.df, som.df, bins=20, rough.interval=0.99) {
+    germ.afs <- germ.df$af[!is.na(germ.df$af) & germ.df$af > 0]
+    som.afs <- som.df$af[!is.na(som.df$af)]
+    g <- bin.afs(germ.afs, bins=bins)  # counts, not probabilities
+    s <- bin.afs(som.afs, bins=bins)
 
     # when fcontrol is used on small candidate sets (i.e., when controlling
     # for depth), there may be several 0 bins in s.
-    g <- g*1*(s > 0)
+#    g <- g*1*(s > 0)
     # XXX: i don't like this. it doesn't quite match the principle, but
     # rather addresses a limitation of the heuristic method.
 
     if (length(s) == 0 | all(g == 0))
         return(list(est.somatic.burden=c(0, 0),
              binmids=as.numeric(names(g)),
-             g=g, s=s, pops=NULL, doublet=doublet))
+             g=g, s=s, pops=NULL))
 
     # returns (lower, upper) bound estimates
     approx.ns <- estimate.somatic.burden(fc=list(g=g, s=s),
-        min.s=1, max.s=nrow(som.df), n.subpops=min(nrow(som.df), 100),
+        min.s=1, max.s=sum(s), n.subpops=min(sum(s), 100),
         rough.interval=rough.interval)
 
+cat(sprintf("fcontrol: dp=%d, max.s=%d (%d), n.subpops=%d, min=%d, max=%d\n",
+germ.df$dp[1], nrow(som.df), sum(s), min(nrow(som.df),100),
+as.integer(approx.ns[1]), as.integer(approx.ns[2])))
     pops <- lapply(approx.ns, function(n) {
-        nt <- pmax(n*(g/sum(g))*1*(s > 0), 0.1)
+#        nt <- pmax(n*(g/sum(g))*1*(s > 0), 0.1)
+nt <- pmax(n*(g/sum(g)), 0.1)
         # ensure na > 0, since FDR would be 0 for any alpha for na=0
         # XXX: the value 0.1 is totally arbitrary and might need to be
         # more carefully thought out.
@@ -378,7 +378,7 @@ fcontrol <- function(germ.df, som.df, min.dp=10, jit.amt=0.0000001, bins=20, dou
 
     return(list(est.somatic.burden=approx.ns,
          binmids=as.numeric(names(g)),
-         g=g, s=s, pops=pops, doublet=doublet))
+         g=g, s=s, pops=pops))
 }
 
 # SUMMARY
@@ -527,8 +527,7 @@ plot.ssnv.region <- function(chr, pos, alt, ref, fits, fit.data, upstream=5e4, d
     # ensure that we estimate at exactly pos
     est.at <- c(seq(pos - upstream, pos-1, length.out=n.gp.points/2), pos,
                 seq(pos+1, pos + downstream, length.out=n.gp.points/2))
-    fit.chr <- as.data.frame(fits[chr,,drop=FALSE])
-    colnames(fit.chr) <- c('a', 'b', 'c', 'd', 'logq')
+    fit.chr <- fits[[chr]]
     gp <- infer.gp(ssnvs=data.frame(pos=est.at),
         fit=fit.chr, hsnps=fit.data[fit.data$chr == chr,],
         chunk=250, flank=gp.extend)
