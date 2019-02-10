@@ -612,10 +612,10 @@ jhelper <- function(dfs, gp.sd.penalty=0.1, gp.sd.cutoff=1) {
     # column reordering makes it easy to recover af, dp, pv
     jdf$jabc <- apply(jdf[,c(seq(1,n*cps,cps), seq(2,n*cps,cps), seq(3,n*cps,cps), seq(4,n*cps,cps))], 1,
         function(row) {
-            afs <- row[1:8]
-            dps <- row[9:16]
-            pvs <- row[17:24]
-            sds <- row[25:32]
+            afs <- row[1:n]
+            dps <- row[(n+1):(2*n)]
+            pvs <- row[(2*n+1):(3*n)]
+            sds <- row[(3*n+1):(4*n)]
             n.penalties <- sum(sds[dps>0 & afs>0] >= gp.sd.cutoff)
             prod(pvs[dps>0 & afs>0]) * prod(rep(gp.sd.penalty, n.penalties))
     })
