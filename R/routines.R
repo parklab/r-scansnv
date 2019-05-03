@@ -36,6 +36,11 @@ get.3mer <- function(df) {
 
     x <- df
 
+    if (!('muttype' %in% colnames(x))) {
+        cat("adding mutation types..\n")
+        x$muttype <- muttype.map[paste(x$refnt, x$altnt, sep = ">")]
+    }
+
     x$ctx <- getSeq(BSgenome.Hsapiens.UCSC.hg19,
                     names=paste("chr", x$chr, sep=''),
                     start=x$pos-1, end=x$pos+1, as.character=TRUE)
@@ -57,7 +62,7 @@ get.fdr.tuning.parameters <- function(somatic, hsnps, bins=20, random.seed=0)
     # estimate the artifact:mutation ratio.
     set.seed(random.seed)
 
-    max.dp <- as.integer(quantile(hsnps$dp, prob=0.9))
+    max.dp <- as.integer(quantile(hsnps$dp, prob=0.8))
     fcs <- lapply(0:max.dp, function(dp)
         fcontrol(germ.df=hsnps[hsnps$dp == dp,],
                 som.df=somatic[somatic$dp == dp,],
@@ -126,7 +131,8 @@ genotype.somatic <- function(gatk, gatk.lowmq, sc.idx, bulk.idx,
     somatic <- merge(gatk, sites.with.ab, all.y=TRUE)
     cat(sprintf("        %d somatic SNV candidates\n", nrow(somatic)))
     # choose the AB nearest to the AF of each candidate
-    somatic$gp.mu <- ifelse(somatic$af < 1/2,
+    # af can be NA if the site has 0 depth
+    somatic$gp.mu <- ifelse(!is.na(somatic$af) & somatic$af < 1/2,
         -abs(somatic$gp.mu), abs(somatic$gp.mu))
     somatic$ab <- 1/(1+exp(-somatic$gp.mu))
 
@@ -333,8 +339,13 @@ estimate.somatic.burden <- function(fc, min.s=1, max.s=5000, n.subpops=10, displ
     srange <- c(1:100, seq(101, max.s, length.out=n.subpops))
     srange <- srange[srange < max.s]
     fraction.embedded <- sapply(srange, sim, g=fc$g, s=fc$s)
-    min.burden <- max(c(1, srange[fraction.embedded >= 1 - (1 - rough.interval)/2]))
-    max.burden <- max(srange[fraction.embedded >= (1 - rough.interval)/2])
+    # max(c(0,... in some cases, there will be no absolutely no overlap
+    # between hSNP VAFs and somatic VAFs, leading to fraction.embedded=0
+    # for all N.  In this case, return 0 and let the caller decide what
+    # to do.
+    min.burden <- max(c(0, srange[fraction.embedded >= 1 - (1 -
+        rough.interval)/2]))
+    max.burden <- max(c(0, srange[fraction.embedded >= (1 - rough.interval)/2]))
     c(min=min.burden, max=max.burden)
 }
 
@@ -448,7 +459,7 @@ plot.ab <- function(ab) {
 # for 96 dimensional mut sigs
 mutsig.cols <- rep(c('deepskyblue', 'black', 'firebrick2', 'grey', 'chartreuse3', 'pink2'), each=16)
 
-plot.3mer <- function(x, ...) {
+plot.3mer <- function(x, no.legend=FALSE, ...) {
     bases <- c("A", 'C', 'G', 'T')
 
     # need to make a table of all possible contexts because they may not
@@ -470,8 +481,9 @@ plot.3mer <- function(x, ...) {
     print(t)
     p <- barplot(t, las=3, col=mutsig.cols, names.arg=tn[order(tn[,2]), 1], space=0.5, border=NA, ...)
     abline(v=(p[seq(4,length(p)-1,4)] + p[seq(5,length(p),4)])/2, col='grey')
-    legend('topright', ncol=2, legend=sort(unique(tn[,2])),
-        fill=mutsig.cols[seq(1, length(mutsig.cols), 16)])
+    if (!no.legend)
+        legend('topright', ncol=2, legend=sort(unique(tn[,2])),
+            fill=mutsig.cols[seq(1, length(mutsig.cols), 16)])
 }
 
 
@@ -519,7 +531,7 @@ plot.fdr <- function(fc, dps=c(10,20,30,60,100,200), target.fdr=0.1, div=2) {
 }
 
 
-plot.ssnv.region <- function(chr, pos, alt, ref, fits, fit.data, upstream=5e4, downstream=5e4, gp.extend=1e5, n.gp.points=100) {
+plot.ssnv.region <- function(chr, pos, alt, ref, fits, fit.data, upstream=5e4, downstream=5e4, gp.extend=1e5, n.gp.points=100, blocks=50) {
     d <- fit.data[fit.data$chr==chr & fit.data$pos >= pos - upstream &
                   fit.data$pos <= pos + downstream,]
 
@@ -528,9 +540,12 @@ plot.ssnv.region <- function(chr, pos, alt, ref, fits, fit.data, upstream=5e4, d
     est.at <- c(seq(pos - upstream, pos-1, length.out=n.gp.points/2), pos,
                 seq(pos+1, pos + downstream, length.out=n.gp.points/2))
     fit.chr <- fits[[chr]]
+    cat("WARNING: if this function produces NA predictions, try reducing the value of 'blocks'\n")
+    # infer.gp can fail when using chunk>1.
+    # this does not affect the calling code, just this plot
     gp <- infer.gp(ssnvs=data.frame(pos=est.at),
         fit=fit.chr, hsnps=fit.data[fit.data$chr == chr,],
-        chunk=250, flank=gp.extend)
+        chunk=blocks, flank=gp.extend, max.hsnp=500)
     gp$pos <- est.at
     plot.gp.confidence(df=gp, add=FALSE)
     points(d$pos, d$hap1/d$dp, pch=20, ylim=0:1)
