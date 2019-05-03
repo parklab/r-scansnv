@@ -17,12 +17,20 @@ abmodel.approx.ctx <- function(x, y, d, hsnp.chunksize=100) {
 }
 
 # ctx is the set of working memory space allocated above
+# IMPORTANT: the main return of this C function is the approximate
+# logp. However, the buffers U, V, B, sqrtW, K and A all contain
+# information about the LAST BLOCK of the Laplace approximation.
+# This means that calling this function with hsnp.chunksize=length(x)
+# (or y or d) returns, among other things, the mode of the Laplace
+# approx.
+# USE THIS WITH CAUTION!
 abmodel.approx.logp <- function(a, b, c, d, ctx,
     max.it=as.integer(50), verbose=FALSE) {
     result <- .Call("laplace_approx_chunk_cpu",
         ctx$hsnp.chunksize, c(a, b, c, d),
         ctx$x, ctx$y, ctx$d, as.integer(length(ctx$x)),
-        ctx$U, ctx$V, ctx$B, ctx$sqrtW, ctx$K, ctx$A,
+        ctx$U, ctx$V, ctx$B, ctx$sqrtW,
+        ctx$K, ctx$A,
         max.it, verbose,
         PACKAGE="scansnv")
     return(result)
@@ -75,6 +83,8 @@ alg3.2.2 <- function(a, b, c, d, ctx, Xnew) {
     v <- forwardsolve(L, outer(sqrtW, rep(1, ncol(covK))) * covK)
 
     cov.new <- outer(Xnew, Xnew, K.func, a=a, b=b, c=c, d=d) - t(v) %*% v
+    if (any(is.na(mean.new)) | any(is.na(cov.new)))
+        stop("NA values predicted")
 
     list(mean=mean.new, cov=cov.new)
 }
@@ -84,30 +94,42 @@ alg3.2.2 <- function(a, b, c, d, ctx, Xnew) {
 # sites within the block, then infer the same approximate distribution
 # on B*|Y*, the balances at the candidate variant sites.
 # returns the mean and variance of the GP at the candidate sites.
+    # WARNING: THIS IS ONLY GUARANTEED TO WORK WHEN ssnvs IS A SINGLE ROW
 infer.gp.block <- function(ssnvs, fit, hsnps, ctx, flank=1e5, max.hsnps=150, verbose=FALSE) {
     a <- fit$a
     b <- fit$b
     c <- fit$c
     dparam <- fit$d
 
-    # row index of the (lower, upper) bounds in hsnps, containing
-    # ssnvs$pos +/- flank
-    left <- findInterval(range(ssnvs$pos)[1], hsnps$pos)
-    up <- findInterval(range(ssnvs$pos)[1] - flank, hsnps$pos)
-    up <- max(up, left - max.hsnps)
+    # make a window of [ssnv position - flank, ssnv position + flank]
+    # then trim it down to a maximum of max.hsnps in each direction.
+    # Remember that ctx has already been allocated assuming its window
+    # will be no larger than 2*max hsnps.
+    # WARNING: THIS IS ONLY GUARANTEED TO WORK WHEN ssnvs IS A SINGLE ROW
+    # the reason is there is  no way to bound the 'middle' term here for
+    # an arbitrary list of positions.
+    middle <- 0
     right <- findInterval(range(ssnvs$pos)[2], hsnps$pos)
     down <- findInterval(range(ssnvs$pos)[2] + flank, hsnps$pos)
+    middle <- down
     down <- min(down, right + max.hsnps)
+    left <- findInterval(range(ssnvs$pos)[1], hsnps$pos)
+    up <- findInterval(range(ssnvs$pos)[1] - flank, hsnps$pos)
+    middle <- middle - up + 1
+    up <- max(up, left - max.hsnps)
     window <- c(up, down)
 
     d <- hsnps[max(window[1], 1):min(window[2], nrow(hsnps)),]
     if (verbose) {
+        print(middle)
         print(window)
-        cat(sprintf("infer.gp.block: %d nearby hets\n", nrow(d)))
+        cat(sprintf("infer.gp.block: window=%d-%d, %d nearby hets\n",
+            min(d$pos), max(d$pos), nrow(d)))
+        cat(sprintf("positions:"))
+        print(ssnvs$pos)
     }
 
     # approx. distn of B|Y at the training sites
-    #z <- alg3.1(a=a, b=b, c=c, d=dparam, X=d$pos, Y=d$hap1, D=d$hap1 + d$hap2)
     ctx$x <- d$pos
     ctx$y <- d$hap1
     ctx$d <- d$hap1 + d$hap2
@@ -124,24 +146,18 @@ infer.gp.block <- function(ssnvs, fit, hsnps, ctx, flank=1e5, max.hsnps=150, ver
 #        column, but should only contain candidates from one chromosome
 # "hsnps" should be the phased hSNPs used for fitting, but again only
 #        from one chromosome corresponding to ssnvs.
-infer.gp <- function(ssnvs, fit, hsnps, chunk=2500, flank=1e5, max.hsnps=150) {
+infer.gp <- function(ssnvs, fit, hsnps, chunk=2500, flank=1e5, max.hsnps=150,
+    verbose=FALSE) {
     nchunks <- ceiling(nrow(ssnvs)/chunk)
+
     ctx <- abmodel.approx.ctx(c(), c(), c(), hsnp.chunksize=2*max.hsnps + 10)
     do.call(rbind, lapply(1:nchunks, function(i) {
-            cat(sprintf("block %d\n", i))
+            if (verbose) cat(sprintf("block %d\n", i))
             start <- 1 + (i-1)*chunk
             stop <- min(i*chunk, nrow(ssnvs))
             infer.gp.block(ssnvs[start:stop,,drop=FALSE],
-                fit, hsnps, ctx=ctx, flank=flank, max.hsnps=max.hsnps)
+                fit, hsnps, ctx=ctx, flank=flank, max.hsnps=max.hsnps,
+                verbose=verbose)
         })
     )
-}
-
-# predicting each site independently
-infer.gp1 <- function(ssnvs, fit, hsnps, flank=1e5, max.hsnps=150) {
-    ctx <- abmodel.approx.ctx(c(), c(), c(), hsnp.chunksize=2*max.hsnps + 10)
-    do.call(rbind, lapply(1:nrow(ssnvs), function(i) {
-            infer.gp.block2(ssnvs[i,,drop=FALSE],
-                fit, hsnps, ctx=ctx, flank=flank, max.hsnps=max.hsnps)
-    }))
 }
